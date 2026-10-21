@@ -1,5 +1,6 @@
 
 from pathlib import Path
+import gc
 
 import numpy as np
 import torch
@@ -19,8 +20,6 @@ from pytorch_grad_cam.utils.image import show_cam_on_image
 # =========================================================
 
 FILE_DIR = Path(__file__).resolve().parent
-
-# This file is inside src/, so the project root is its parent.
 PROJECT_ROOT = FILE_DIR.parent
 
 MODEL_PATHS = {
@@ -31,28 +30,7 @@ MODEL_PATHS = {
     "efficientnet_b0": PROJECT_ROOT / "models" / "efficientnet_b0_best.pth",
 }
 
-
-# Hugging Face repository containing the trained checkpoints.
 HF_REPO_ID = "vaishnavisawant175/cancer-classification-checkpoints"
-
-
-def get_checkpoint_path(model_name):
-    """Use a local checkpoint or download it from Hugging Face."""
-    if model_name not in MODEL_PATHS:
-        raise ValueError(f"Unknown model: {model_name}")
-
-    local_path = MODEL_PATHS[model_name]
-
-    if local_path.is_file():
-        return local_path
-
-    downloaded_path = hf_hub_download(
-        repo_id=HF_REPO_ID,
-        filename=local_path.name,
-    )
-
-    return Path(downloaded_path)
-
 
 RESULTS_ROOT = PROJECT_ROOT / "results" / "gradcam"
 
@@ -73,7 +51,30 @@ PREPROCESS = transforms.Compose([
 
 
 # =========================================================
-# 2. BUILD MODEL ARCHITECTURES
+# 2. HUGGING FACE CHECKPOINT DOWNLOAD
+# =========================================================
+
+def get_checkpoint_path(model_name):
+    """Return a local checkpoint or download it from Hugging Face."""
+
+    if model_name not in MODEL_PATHS:
+        raise ValueError(f"Unknown model: {model_name}")
+
+    local_path = MODEL_PATHS[model_name]
+
+    if local_path.is_file():
+        return local_path
+
+    downloaded_path = hf_hub_download(
+        repo_id=HF_REPO_ID,
+        filename=local_path.name,
+    )
+
+    return Path(downloaded_path)
+
+
+# =========================================================
+# 3. BUILD MODEL ARCHITECTURES
 # Must match the architectures used during training.
 # =========================================================
 
@@ -101,8 +102,6 @@ def build_model(model_name):
         )
 
     elif model_name == "resnet50_improved":
-        # Assumes the trained model uses standard ResNet50
-        # with a 31-class final fully connected layer.
         model = models.resnet50(weights=None)
         model.fc = nn.Linear(
             model.fc.in_features,
@@ -123,20 +122,25 @@ def build_model(model_name):
 
 
 # =========================================================
-# 3. LOAD THE PROJECT'S CLASS MAPPING
+# 4. LOAD THE PROJECT'S CLASS MAPPING
 # =========================================================
 
 _CLASS_TO_IDX = None
 
 
 def load_class_mapping():
+    """
+    Load the shared class mapping from a checkpoint.
+
+    Only the first checkpoint containing a valid mapping is
+    needed. The mapping remains in memory because it is small.
+    """
 
     global _CLASS_TO_IDX
 
     if _CLASS_TO_IDX is not None:
         return _CLASS_TO_IDX
 
-    # Use a mapping saved in a checkpoint, if available.
     for model_name in MODEL_PATHS:
 
         checkpoint_path = get_checkpoint_path(model_name)
@@ -147,25 +151,48 @@ def load_class_mapping():
             weights_only=False,
         )
 
+        mapping = None
+
         if isinstance(checkpoint, dict):
             mapping = checkpoint.get("class_to_idx")
 
-            if mapping is not None:
-                mapping = {
-                    str(label): int(index)
-                    for label, index in mapping.items()
-                }
+        if mapping is not None:
 
-                if len(mapping) != NUM_CLASSES:
-                    raise ValueError(
-                        "Checkpoint mapping does not contain "
-                        f"{NUM_CLASSES} classes."
-                    )
+            mapping = {
+                str(label): int(index)
+                for label, index in mapping.items()
+            }
 
-                _CLASS_TO_IDX = mapping
-                return _CLASS_TO_IDX
+            if len(mapping) != NUM_CLASSES:
+                del checkpoint
+                gc.collect()
 
-    # Fallback: get the mapping from the training dataset.
+                raise ValueError(
+                    "Checkpoint mapping does not contain "
+                    f"{NUM_CLASSES} classes."
+                )
+
+            if sorted(mapping.values()) != list(range(NUM_CLASSES)):
+                del checkpoint
+                gc.collect()
+
+                raise ValueError(
+                    "Checkpoint class indices must range from "
+                    f"0 to {NUM_CLASSES - 1}."
+                )
+
+            _CLASS_TO_IDX = mapping
+
+            del checkpoint
+            gc.collect()
+
+            return _CLASS_TO_IDX
+
+        # Do not retain checkpoints that lack a mapping.
+        del checkpoint
+        gc.collect()
+
+    # Fallback for environments with the dataset available.
     import sys
 
     if str(PROJECT_ROOT) not in sys.path:
@@ -189,52 +216,58 @@ def load_class_mapping():
             f"found {len(_CLASS_TO_IDX)}."
         )
 
+    if sorted(_CLASS_TO_IDX.values()) != list(range(NUM_CLASSES)):
+        raise ValueError(
+            "Class indices must range from "
+            f"0 to {NUM_CLASSES - 1}."
+        )
+
     return _CLASS_TO_IDX
 
 
 # =========================================================
-# 4. LOAD AND CACHE MODELS
-# Each model is loaded only once per Python process.
+# 5. LOAD ONE MODEL AT A TIME
+# No global model cache.
 # =========================================================
 
-_LOADED_MODELS = {}
-
-
 def load_model(model_name):
+    """
+    Load a single model without retaining it in a global cache.
+    """
 
-    if model_name in _LOADED_MODELS:
-        return _LOADED_MODELS[model_name]
+    if model_name not in MODEL_PATHS:
+        raise ValueError(f"Unknown model: {model_name}")
+
+    # Resolve mapping before loading the model checkpoint.
+    # This avoids unnecessarily holding two checkpoints at once.
+    current_mapping = load_class_mapping()
 
     checkpoint_path = get_checkpoint_path(model_name)
 
     checkpoint = torch.load(
         checkpoint_path,
-        map_location=DEVICE,
+        map_location="cpu",
         weights_only=False,
     )
 
-    model = build_model(model_name)
+    model = None
 
-    if isinstance(checkpoint, dict):
-        state_dict = checkpoint.get(
-            "model_state_dict",
-            checkpoint,
-        )
-    else:
-        state_dict = checkpoint
+    try:
+        model = build_model(model_name)
 
-    model.load_state_dict(state_dict)
+        if isinstance(checkpoint, dict):
+            state_dict = checkpoint.get(
+                "model_state_dict",
+                checkpoint,
+            )
 
-    model.to(DEVICE)
-    model.eval()
+            saved_mapping = checkpoint.get("class_to_idx")
 
-    # Get the common class mapping.
-    current_mapping = load_class_mapping()
+        else:
+            state_dict = checkpoint
+            saved_mapping = None
 
-    # Verify the checkpoint mapping when it is available.
-    if isinstance(checkpoint, dict):
-        saved_mapping = checkpoint.get("class_to_idx")
-
+        # Validate class ordering when checkpoint metadata exists.
         if saved_mapping is not None:
 
             saved_mapping = {
@@ -248,18 +281,35 @@ def load_model(model_name):
                     "does not match the project's mapping."
                 )
 
+        model.load_state_dict(state_dict)
+
+    except Exception:
+        del checkpoint
+
+        if model is not None:
+            del model
+
+        gc.collect()
+        raise
+
+    # Release checkpoint state before inference.
+    del state_dict
+    del checkpoint
+    gc.collect()
+
+    model.to(DEVICE)
+    model.eval()
+
     idx_to_class = {
         index: label
         for label, index in current_mapping.items()
     }
 
-    _LOADED_MODELS[model_name] = (model, idx_to_class)
-
     return model, idx_to_class
 
 
 # =========================================================
-# 5. SWIN TRANSFORMER RESHAPE
+# 6. SWIN TRANSFORMER RESHAPE
 # =========================================================
 
 def swin_reshape_transform(tensor):
@@ -275,7 +325,7 @@ def swin_reshape_transform(tensor):
 
 
 # =========================================================
-# 6. SELECT TARGET LAYER FOR GRAD-CAM
+# 7. SELECT TARGET LAYER FOR GRAD-CAM
 # =========================================================
 
 def get_target_layers(model_name, model):
@@ -284,7 +334,9 @@ def get_target_layers(model_name, model):
         return [model.features[-1]], None
 
     elif model_name == "swin_tiny":
-        return [model.features[-1][-1].norm2], swin_reshape_transform
+        return [
+            model.features[-1][-1].norm2
+        ], swin_reshape_transform
 
     elif model_name == "densenet121":
         return [model.features.denseblock4], None
@@ -301,9 +353,7 @@ def get_target_layers(model_name, model):
 
 
 # =========================================================
-# 7. PREPARE AN IMAGE
-# Accepts a PIL image or a local file path.
-# The frontend can pass its uploaded PIL image directly.
+# 8. PREPARE AN IMAGE
 # =========================================================
 
 def prepare_image(image):
@@ -331,7 +381,7 @@ def prepare_image(image):
 
 
 # =========================================================
-# 8. GENERATE GRAD-CAM FOR ONE MODEL
+# 9. GENERATE GRAD-CAM FOR ONE MODEL
 # =========================================================
 
 def generate_gradcam(
@@ -341,148 +391,210 @@ def generate_gradcam(
     image_name="uploaded_image",
 ):
     """
-    Args:
-        model_name: A key from MODEL_PATHS.
-        image: Uploaded PIL image or local image path.
-        save_results: Save output images when True.
-        image_name: Name used for saved output files.
+    Generate a prediction and Grad-CAM visualization for one model.
 
-    Returns:
-        Prediction, confidence, probabilities, original image,
-        heatmap and overlay as arrays.
+    Returns class probabilities and visualization arrays.
+    The model itself is not cached globally.
     """
 
-    model, idx_to_class = load_model(model_name)
+    model = None
+    input_tensor = None
+    probabilities = None
+    logits = None
 
-    image_rgb, input_tensor = prepare_image(image)
+    try:
+        # Load only the current model.
+        model, idx_to_class = load_model(model_name)
 
-    # 1. Predict the class.
-    with torch.inference_mode():
-        logits = model(input_tensor)
-        probabilities = torch.softmax(logits, dim=1)[0]
+        image_rgb, input_tensor = prepare_image(image)
 
-        predicted_idx = int(
-            probabilities.argmax().item()
+        # 1. Prediction.
+        with torch.inference_mode():
+            logits = model(input_tensor)
+
+            probabilities = torch.softmax(
+                logits,
+                dim=1,
+            )[0]
+
+            predicted_idx = int(
+                probabilities.argmax().item()
+            )
+
+            confidence = float(
+                probabilities[predicted_idx].item()
+            )
+
+            # Preserve the probabilities needed by stacking.
+            probabilities_array = (
+                probabilities.detach().cpu().numpy().copy()
+            )
+
+        predicted_class = idx_to_class[predicted_idx]
+
+        del logits
+        logits = None
+
+        del probabilities
+        probabilities = None
+
+        # 2. Grad-CAM.
+        target_layers, reshape_transform = get_target_layers(
+            model_name,
+            model,
         )
 
-        confidence = float(
-            probabilities[predicted_idx].item()
-        )
+        cam_kwargs = {}
 
-    predicted_class = idx_to_class[predicted_idx]
+        if reshape_transform is not None:
+            cam_kwargs["reshape_transform"] = reshape_transform
 
-    # 2. Generate Grad-CAM.
-    target_layers, reshape_transform = get_target_layers(
-        model_name,
-        model,
-    )
+        # Grad-CAM requires gradients. Do not wrap this block
+        # in inference_mode() or no_grad().
+        with GradCAM(
+            model=model,
+            target_layers=target_layers,
+            **cam_kwargs,
+        ) as cam:
 
-    cam_kwargs = {}
+            grayscale_cam = cam(
+                input_tensor=input_tensor,
+                targets=[
+                    ClassifierOutputTarget(predicted_idx)
+                ],
+            )[0]
 
-    if reshape_transform is not None:
-        cam_kwargs["reshape_transform"] = reshape_transform
-
-    # Grad-CAM requires gradients, so do not use no_grad or
-    # inference_mode around this section.
-    with GradCAM(
-        model=model,
-        target_layers=target_layers,
-        **cam_kwargs,
-    ) as cam:
-
-        grayscale_cam = cam(
-            input_tensor=input_tensor,
-            targets=[
-                ClassifierOutputTarget(predicted_idx)
-            ],
-        )[0]
-
-    overlay = show_cam_on_image(
-        image_rgb,
-        grayscale_cam,
-        use_rgb=True,
-    )
-
-    result = {
-        "model": model_name,
-        "predicted_class": predicted_class,
-        "predicted_index": predicted_idx,
-        "confidence": confidence,
-        "probabilities": probabilities.detach().cpu().numpy(),
-        "class_to_idx": load_class_mapping(),
-        "original": image_rgb,
-        "heatmap": grayscale_cam,
-        "overlay": overlay,
-        "heatmap_path": None,
-        "overlay_path": None,
-        "comparison_path": None,
-    }
-
-    # 3. Optionally save images to disk.
-    # Streamlit can display the returned arrays without saving.
-    if save_results:
-
-        import matplotlib.pyplot as plt
-
-        output_dir = RESULTS_ROOT / model_name
-        output_dir.mkdir(parents=True, exist_ok=True)
-
-        safe_name = Path(image_name).stem or "uploaded_image"
-
-        heatmap_path = output_dir / f"{safe_name}_heatmap.png"
-        overlay_path = output_dir / f"{safe_name}_overlay.png"
-        comparison_path = output_dir / f"{safe_name}_comparison.png"
-
-        Image.fromarray(overlay).save(overlay_path)
-
-        plt.imsave(
-            heatmap_path,
+        # Ensure visualization arrays do not retain GPU tensors.
+        grayscale_cam = np.asarray(
             grayscale_cam,
-            cmap="jet",
+            dtype=np.float32,
+        ).copy()
+
+        overlay = show_cam_on_image(
+            image_rgb,
+            grayscale_cam,
+            use_rgb=True,
         )
 
-        fig, axes = plt.subplots(
-            1, 3,
-            figsize=(15, 5),
-        )
+        result = {
+            "model": model_name,
+            "predicted_class": predicted_class,
+            "predicted_index": predicted_idx,
+            "confidence": confidence,
+            "probabilities": probabilities_array,
+            "class_to_idx": load_class_mapping(),
+            "original": image_rgb,
+            "heatmap": grayscale_cam,
+            "overlay": overlay,
+            "heatmap_path": None,
+            "overlay_path": None,
+            "comparison_path": None,
+        }
 
-        axes[0].imshow(image_rgb)
-        axes[0].set_title("Original Image")
+        # 3. Optionally save visualization files.
+        if save_results:
 
-        axes[1].imshow(grayscale_cam, cmap="jet")
-        axes[1].set_title("Grad-CAM Heatmap")
+            import matplotlib.pyplot as plt
 
-        axes[2].imshow(overlay)
-        axes[2].set_title("Heatmap Overlay")
+            output_dir = RESULTS_ROOT / model_name
+            output_dir.mkdir(
+                parents=True,
+                exist_ok=True,
+            )
 
-        for ax in axes:
-            ax.axis("off")
+            safe_name = (
+                Path(image_name).stem or "uploaded_image"
+            )
 
-        fig.suptitle(
-            f"{model_name}\n"
-            f"Prediction: {predicted_class} | "
-            f"Confidence: {confidence * 100:.2f}%"
-        )
+            heatmap_path = (
+                output_dir / f"{safe_name}_heatmap.png"
+            )
 
-        fig.tight_layout()
+            overlay_path = (
+                output_dir / f"{safe_name}_overlay.png"
+            )
 
-        fig.savefig(
-            comparison_path,
-            dpi=200,
-            bbox_inches="tight",
-        )
+            comparison_path = (
+                output_dir / f"{safe_name}_comparison.png"
+            )
 
-        plt.close(fig)
+            Image.fromarray(overlay).save(overlay_path)
 
-        result["heatmap_path"] = heatmap_path
-        result["overlay_path"] = overlay_path
-        result["comparison_path"] = comparison_path
+            plt.imsave(
+                heatmap_path,
+                grayscale_cam,
+                cmap="jet",
+            )
 
-    return result
+            fig, axes = plt.subplots(
+                1,
+                3,
+                figsize=(15, 5),
+            )
+
+            try:
+                axes[0].imshow(image_rgb)
+                axes[0].set_title("Original Image")
+
+                axes[1].imshow(
+                    grayscale_cam,
+                    cmap="jet",
+                )
+                axes[1].set_title("Grad-CAM Heatmap")
+
+                axes[2].imshow(overlay)
+                axes[2].set_title("Heatmap Overlay")
+
+                for ax in axes:
+                    ax.axis("off")
+
+                fig.suptitle(
+                    f"{model_name}\n"
+                    f"Prediction: {predicted_class} | "
+                    f"Confidence: {confidence * 100:.2f}%"
+                )
+
+                fig.tight_layout()
+
+                fig.savefig(
+                    comparison_path,
+                    dpi=200,
+                    bbox_inches="tight",
+                )
+
+            finally:
+                plt.close(fig)
+
+            result["heatmap_path"] = heatmap_path
+            result["overlay_path"] = overlay_path
+            result["comparison_path"] = comparison_path
+
+        return result
+
+    finally:
+        # Remove references to the current model and its
+        # temporary tensors when this model finishes.
+        if logits is not None:
+            del logits
+
+        if probabilities is not None:
+            del probabilities
+
+        if input_tensor is not None:
+            del input_tensor
+
+        if model is not None:
+            model.to("cpu")
+            del model
+
+        gc.collect()
+
+        if DEVICE.type == "cuda":
+            torch.cuda.empty_cache()
 
 
 # =========================================================
-# 9. GENERATE GRAD-CAM FOR ALL FIVE MODELS
+# 10. GENERATE GRAD-CAM FOR ALL FIVE MODELS
 # =========================================================
 
 def generate_all_gradcams(
@@ -491,9 +603,12 @@ def generate_all_gradcams(
     image_name="uploaded_image",
 ):
     """
-    Process the same uploaded image with all five models.
+    Process an image with all five models sequentially.
 
-    If one model fails, the remaining models are still attempted.
+    Model objects are not cached. Each model is released after
+    its prediction and Grad-CAM visualization are generated.
+
+    Results and errors are collected separately.
     """
 
     results = {}
@@ -510,7 +625,15 @@ def generate_all_gradcams(
             )
 
         except Exception as error:
-            errors[model_name] = str(error)
+            errors[model_name] = (
+                f"{type(error).__name__}: {error}"
+            )
+
+        finally:
+            gc.collect()
+
+            if DEVICE.type == "cuda":
+                torch.cuda.empty_cache()
 
     return {
         "results": results,
@@ -520,9 +643,8 @@ def generate_all_gradcams(
 
 
 # =========================================================
-# 10. MODULE CHECK
-# No image path is required.
-# This does not load models or generate heatmaps.
+# 11. MODULE CHECK
+# Does not load models or generate heatmaps.
 # =========================================================
 
 if __name__ == "__main__":
@@ -536,10 +658,11 @@ if __name__ == "__main__":
     print("Available models:")
 
     for model_name, checkpoint_path in MODEL_PATHS.items():
+
         status = (
-            "checkpoint found"
+            "local checkpoint found"
             if checkpoint_path.is_file()
-            else "checkpoint missing"
+            else "checkpoint will be retrieved from Hugging Face"
         )
 
         print(f"  - {model_name}: {status}")
