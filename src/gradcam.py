@@ -7,6 +7,7 @@ import torch.nn as nn
 
 from PIL import Image
 from torchvision import models, transforms
+from huggingface_hub import hf_hub_download
 
 from pytorch_grad_cam import GradCAM
 from pytorch_grad_cam.utils.model_targets import ClassifierOutputTarget
@@ -29,6 +30,29 @@ MODEL_PATHS = {
     "resnet50_improved": PROJECT_ROOT / "models" / "resnet50_improved_best.pth",
     "efficientnet_b0": PROJECT_ROOT / "models" / "efficientnet_b0_best.pth",
 }
+
+
+# Hugging Face repository containing the trained checkpoints.
+HF_REPO_ID = "vaishnavisawant175/cancer-classification-checkpoints"
+
+
+def get_checkpoint_path(model_name):
+    """Use a local checkpoint or download it from Hugging Face."""
+    if model_name not in MODEL_PATHS:
+        raise ValueError(f"Unknown model: {model_name}")
+
+    local_path = MODEL_PATHS[model_name]
+
+    if local_path.is_file():
+        return local_path
+
+    downloaded_path = hf_hub_download(
+        repo_id=HF_REPO_ID,
+        filename=local_path.name,
+    )
+
+    return Path(downloaded_path)
+
 
 RESULTS_ROOT = PROJECT_ROOT / "results" / "gradcam"
 
@@ -113,10 +137,9 @@ def load_class_mapping():
         return _CLASS_TO_IDX
 
     # Use a mapping saved in a checkpoint, if available.
-    for checkpoint_path in MODEL_PATHS.values():
+    for model_name in MODEL_PATHS:
 
-        if not checkpoint_path.is_file():
-            continue
+        checkpoint_path = get_checkpoint_path(model_name)
 
         checkpoint = torch.load(
             checkpoint_path,
@@ -182,12 +205,7 @@ def load_model(model_name):
     if model_name in _LOADED_MODELS:
         return _LOADED_MODELS[model_name]
 
-    checkpoint_path = MODEL_PATHS[model_name]
-
-    if not checkpoint_path.is_file():
-        raise FileNotFoundError(
-            f"Checkpoint not found:\n{checkpoint_path}"
-        )
+    checkpoint_path = get_checkpoint_path(model_name)
 
     checkpoint = torch.load(
         checkpoint_path,

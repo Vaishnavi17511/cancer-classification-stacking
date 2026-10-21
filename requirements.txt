@@ -10,3 +10,8 @@ opencv-python
 streamlit
 tqdm
 PyYAML
+huggingface_hub
+
+grad-cam
+
+joblib
