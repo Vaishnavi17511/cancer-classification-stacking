@@ -1,0 +1,20 @@
+.venv/
+.venv_old/
+__pycache__/
+*.py[cod]
+.env
+.streamlit/secrets.toml
+
+cancer dataset/
+patient_split_dataset/
+duplicate_quarantine/
+
+models/*.pth
+results/*.csv
+results/*.png
+results/*.jpg
+results/*.txt
+
+requirements_local.txt
+duplicate_leakage_report.txt
+patient_split_report.txt
