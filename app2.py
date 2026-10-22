@@ -1,9 +1,12 @@
 from pathlib import Path
+from io import BytesIO
+import html
 
 import joblib
 import numpy as np
 import pandas as pd
 import streamlit as st
+import matplotlib.pyplot as plt
 from PIL import Image
 
 from src.gradcam import generate_all_gradcams
@@ -21,10 +24,7 @@ st.set_page_config(
 )
 
 PROJECT_ROOT = Path(__file__).resolve().parent
-
-STACKING_PATH = (
-    PROJECT_ROOT / "results" / "stacking_meta_learner.joblib"
-)
+STACKING_PATH = PROJECT_ROOT / "results" / "stacking_meta_learner.joblib"
 
 MODEL_NAMES = {
     "convnext_tiny": "ConvNeXt-Tiny",
@@ -42,6 +42,13 @@ MODEL_ORDER = [
     "resnet50_improved",
     "efficientnet_b0",
 ]
+
+# Export styling
+EXPORT_BG = "#0B1120"
+EXPORT_HEADER = "#162238"
+EXPORT_ACCENT = "#5EEAD4"
+EXPORT_TEXT = "#F1F5F9"
+EXPORT_MUTED = "#94A3B8"
 
 
 # =========================================================
@@ -258,6 +265,146 @@ st.markdown(
 
 
 # =========================================================
+# PNG EXPORT HELPERS
+# =========================================================
+
+def dataframe_to_png(
+    dataframe,
+    title,
+    subtitle=None,
+    index=True,
+    filename_prefix="table",
+):
+    """
+    Render a pandas DataFrame as a downloadable PNG image.
+
+    Uses a dark navy background and teal accent to match the app.
+    Returns PNG bytes suitable for st.download_button.
+    """
+    if dataframe is None or dataframe.empty:
+        return None
+
+    display_df = dataframe.copy()
+
+    if index:
+        display_df = display_df.reset_index()
+
+    # Keep values readable and protect Matplotlib from excessively long text.
+    display_df = display_df.fillna("")
+
+    for column in display_df.columns:
+        display_df[column] = display_df[column].map(
+            lambda value: str(value)
+        )
+
+    nrows, ncols = display_df.shape
+
+    # Scale width based on number of columns and height based on rows.
+    # Wide probability matrices need extra width for all class names.
+    fig_width = min(max(10, ncols * 1.15), 36)
+    fig_height = min(max(3.5, 2.0 + nrows * 0.48), 30)
+
+    fig, ax = plt.subplots(figsize=(fig_width, fig_height), dpi=200)
+    fig.patch.set_facecolor(EXPORT_BG)
+    ax.set_facecolor(EXPORT_BG)
+    ax.axis("off")
+
+    title_text = title
+    if subtitle:
+        title_text += f"\n{subtitle}"
+
+    ax.set_title(
+        title_text,
+        loc="left",
+        color=EXPORT_ACCENT,
+        fontsize=15 if ncols <= 12 else 12,
+        fontweight="bold",
+        pad=18,
+    )
+
+    table = ax.table(
+        cellText=display_df.values,
+        colLabels=display_df.columns,
+        cellLoc="center",
+        colLoc="center",
+        loc="center",
+    )
+
+    table.auto_set_font_size(False)
+
+    font_size = 8 if ncols <= 12 else (6 if ncols <= 24 else 4.5)
+    table.set_fontsize(font_size)
+    table.scale(1, 1.45)
+
+    for (row, col), cell in table.get_celld().items():
+        cell.set_edgecolor("#26364D")
+        cell.set_linewidth(0.45)
+
+        if row == 0:
+            cell.set_facecolor(EXPORT_HEADER)
+            cell.get_text().set_color(EXPORT_ACCENT)
+            cell.get_text().set_fontweight("bold")
+        else:
+            cell.set_facecolor(
+                "#142137" if row % 2 == 1 else "#101A2B"
+            )
+            cell.get_text().set_color(EXPORT_TEXT)
+
+    # Let the table fit the available image canvas.
+    plt.tight_layout(pad=2.0)
+
+    buffer = BytesIO()
+
+    fig.savefig(
+        buffer,
+        format="png",
+        dpi=200,
+        bbox_inches="tight",
+        facecolor=fig.get_facecolor(),
+    )
+
+    plt.close(fig)
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
+def add_png_download(
+    dataframe,
+    title,
+    filename,
+    key,
+    subtitle=None,
+    index=True,
+    label=None,
+):
+    """Show a download button for a DataFrame rendered as PNG."""
+    if dataframe is None or dataframe.empty:
+        st.info("There is no table data available to export.")
+        return
+
+    try:
+        png_bytes = dataframe_to_png(
+            dataframe=dataframe,
+            title=title,
+            subtitle=subtitle,
+            index=index,
+        )
+
+        if png_bytes:
+            st.download_button(
+                label=label or f"🖼️ Download {title} (PNG)",
+                data=png_bytes,
+                file_name=filename,
+                mime="image/png",
+                key=key,
+            )
+        else:
+            st.warning("Could not create the PNG export.")
+    except Exception as exc:
+        st.error(f"Could not create PNG export: {exc}")
+
+
+# =========================================================
 # HELPER FUNCTIONS
 # =========================================================
 
@@ -362,7 +509,9 @@ def show_model_cards(results):
 
         for column, model_key in zip(columns, group):
             result = results[model_key]
-            prediction = result.get("predicted_class", "Unavailable")
+            prediction = html.escape(
+                str(result.get("predicted_class", "Unavailable"))
+            )
 
             try:
                 confidence = float(result.get("confidence", 0))
@@ -375,12 +524,10 @@ def show_model_cards(results):
                     <div class="model-card">
                         <div class="small-label">BASE MODEL</div>
                         <div class="model-name">
-                            {MODEL_NAMES.get(model_key, model_key)}
+                            {MODEL_NAMES.get(model_key, html.escape(str(model_key)))}
                         </div>
                         <div class="small-label">PREDICTED CLASS</div>
-                        <div class="model-prediction">
-                            {prediction}
-                        </div>
+                        <div class="model-prediction">{prediction}</div>
                         <div class="small-label">
                             Predicted-class probability
                         </div>
@@ -465,7 +612,6 @@ def load_stacking_artifact(path_string):
 
 def prepare_stacking_features(results, artifact):
     """Build the exact feature order expected by the trained meta-learner."""
-
     class_to_idx = artifact["class_to_idx"]
     num_classes = int(artifact["num_classes"])
     expected_features = int(artifact["input_features"])
@@ -501,17 +647,23 @@ def prepare_stacking_features(results, artifact):
             continue
 
         if not np.isfinite(probabilities).all():
-            errors.append(f"{model_key}: probabilities contain invalid values.")
+            errors.append(
+                f"{model_key}: probabilities contain invalid values."
+            )
             continue
 
         if (probabilities < 0).any():
-            errors.append(f"{model_key}: negative probabilities detected.")
+            errors.append(
+                f"{model_key}: negative probabilities detected."
+            )
             continue
 
         total = probabilities.sum()
 
         if total <= 0:
-            errors.append(f"{model_key}: probability sum is zero.")
+            errors.append(
+                f"{model_key}: probability sum is zero."
+            )
             continue
 
         probability_blocks.append(probabilities / total)
@@ -589,9 +741,9 @@ st.markdown(
 
 st.markdown(
     '<div class="disclaimer"><b>Research prototype</b><br>'
-    'This application is intended for educational and research purposes. '
-    'It is not a clinically validated diagnostic tool and must not be used '
-    'to make medical decisions.</div>',
+    "This application is intended for educational and research purposes. "
+    "It is not a clinically validated diagnostic tool and must not be used "
+    "to make medical decisions.</div>",
     unsafe_allow_html=True,
 )
 
@@ -632,7 +784,7 @@ with left:
 
     st.markdown(
         '<div class="upload-note">Supported formats: JPG, JPEG, PNG, TIFF. '
-        'Use a clear tissue image for research analysis.</div>',
+        "Use a clear tissue image for research analysis.</div>",
         unsafe_allow_html=True,
     )
 
@@ -748,8 +900,8 @@ if uploaded_file is not None and saved is not None:
             columns = st.columns(3)
 
             for column, (model_key, result) in zip(columns, group):
-                prediction = result.get(
-                    "predicted_class", "Unavailable"
+                prediction = html.escape(
+                    str(result.get("predicted_class", "Unavailable"))
                 )
 
                 try:
@@ -763,12 +915,10 @@ if uploaded_file is not None and saved is not None:
                         <div class="model-card">
                             <div class="small-label">BASE MODEL</div>
                             <div class="model-name">
-                                {MODEL_NAMES.get(model_key, model_key)}
+                                {MODEL_NAMES.get(model_key, html.escape(str(model_key)))}
                             </div>
                             <div class="small-label">PREDICTED CLASS</div>
-                            <div class="model-prediction">
-                                {prediction}
-                            </div>
+                            <div class="model-prediction">{prediction}</div>
                             <div class="small-label">
                                 Predicted-class probability
                             </div>
@@ -802,6 +952,17 @@ if uploaded_file is not None and saved is not None:
                 st.caption(
                     "Rows represent models; columns represent the cancer "
                     "classes. Values are model output probabilities (%)."
+                )
+
+                # NEW: Individual class probability matrix PNG download
+                add_png_download(
+                    dataframe=individual_df,
+                    title="Individual Class Probability Matrix",
+                    filename="individual_class_probability_matrix.png",
+                    key="download_individual_probability_matrix_png",
+                    subtitle="Base-model probabilities (%)",
+                    index=True,
+                    label="🖼️ Download Individual Probability Matrix (PNG)",
                 )
             else:
                 st.warning("Individual probability matrix is unavailable.")
@@ -863,9 +1024,7 @@ if uploaded_file is not None and saved is not None:
                             dtype=np.float64,
                         )
 
-                        model_classes = np.asarray(
-                            meta_model.classes_
-                        )
+                        model_classes = np.asarray(meta_model.classes_)
 
                         if len(meta_probabilities) != len(model_classes):
                             st.error(
@@ -887,9 +1046,7 @@ if uploaded_file is not None and saved is not None:
                                 key=class_probabilities.get,
                             )
 
-                            predicted_class = idx_to_class.get(
-                                predicted_index
-                            )
+                            predicted_class = idx_to_class.get(predicted_index)
 
                             if predicted_class is None:
                                 st.error(
@@ -899,8 +1056,7 @@ if uploaded_file is not None and saved is not None:
                                 )
                             else:
                                 confidence = (
-                                    class_probabilities[predicted_index]
-                                    * 100
+                                    class_probabilities[predicted_index] * 100
                                 )
 
                                 col1, col2, col3 = st.columns(3)
@@ -913,7 +1069,7 @@ if uploaded_file is not None and saved is not None:
                                                 FINAL PREDICTED CLASS
                                             </div>
                                             <div class="metric-value">
-                                                {predicted_class}
+                                                {html.escape(str(predicted_class))}
                                             </div>
                                             <div class="metric-note">
                                                 Stacking meta-learner output
@@ -943,7 +1099,7 @@ if uploaded_file is not None and saved is not None:
 
                                 with col3:
                                     st.markdown(
-                                        f"""
+                                        """
                                         <div class="metric-panel">
                                             <div class="metric-title">
                                                 META-LEARNER
@@ -959,8 +1115,8 @@ if uploaded_file is not None and saved is not None:
                                         unsafe_allow_html=True,
                                     )
 
-                                # Fill all class probabilities using the
-                                # actual class indices from the meta-model.
+                                # Fill class probabilities using the actual
+                                # class indices from the meta-model.
                                 full_probabilities = np.zeros(
                                     num_classes,
                                     dtype=np.float64,
@@ -990,14 +1146,41 @@ if uploaded_file is not None and saved is not None:
                                     hide_index=True,
                                 )
 
-                                st.download_button(
-                                    "⬇️ Download Stacking Probabilities (CSV)",
-                                    data=stacking_df.to_csv(
-                                        index=False
-                                    ).encode("utf-8"),
-                                    file_name="stacking_probabilities.csv",
-                                    mime="text/csv",
+                                # Existing CSV download
+                                csv_bytes = stacking_df.to_csv(
+                                    index=False
+                                ).encode("utf-8")
+
+                                # NEW: Generate PNG for the stacking table
+                                png_bytes = dataframe_to_png(
+                                    dataframe=stacking_df,
+                                    title="All Stacking Class Probabilities",
+                                    subtitle=(
+                                        "Logistic Regression meta-learner "
+                                        "probabilities (%)"
+                                    ),
+                                    index=False,
                                 )
+
+                                download_col1, download_col2 = st.columns(2)
+
+                                with download_col1:
+                                    st.download_button(
+                                        "⬇️ Download Stacking Probabilities (CSV)",
+                                        data=csv_bytes,
+                                        file_name="stacking_probabilities.csv",
+                                        mime="text/csv",
+                                        key="download_stacking_probabilities_csv",
+                                    )
+
+                                with download_col2:
+                                    st.download_button(
+                                        "🖼️ Download Stacking Probabilities (PNG)",
+                                        data=png_bytes,
+                                        file_name="stacking_probabilities.png",
+                                        mime="image/png",
+                                        key="download_stacking_probabilities_png",
+                                    )
 
                                 with st.expander(
                                     "View top 5 class probabilities"
@@ -1011,9 +1194,7 @@ if uploaded_file is not None and saved is not None:
                                         st.progress(
                                             min(
                                                 max(
-                                                    float(
-                                                        row["Probability (%)"]
-                                                    ) / 100,
+                                                    float(row["Probability (%)"]) / 100,
                                                     0,
                                                 ),
                                                 1,
